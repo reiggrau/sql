@@ -16,11 +16,10 @@ CREATE TABLE players (
 
 SEED = """
 INSERT INTO players (username, password_hash) VALUES
-	('Alice', 'password1'),
-	('Bob', 'password2'),
-    ('Carol', 'password3'),
-    ('Dave', 'password4'),
-    ('Eve', 'password5');
+	('Player1', 'pass1'),
+	('Player2', 'pass2'),
+    ('Player3', 'pass3'),
+    ('Player4', 'pass4');
 """
 
 

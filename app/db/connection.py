@@ -24,3 +24,12 @@ def fetch_all(sql: str, params: tuple | None = None) -> list[dict]:
         with conn.cursor() as cur:
             cur.execute(sql, params or ())
             return cur.fetchall()
+
+
+def execute(sql: str, params: tuple | None = None) -> dict | None:
+    """Execute a write query (INSERT/UPDATE/DELETE) and return the result."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            conn.commit()
+            return cur.fetchone()
