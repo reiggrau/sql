@@ -1,14 +1,20 @@
 """Main application file for the SQL API."""
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from .routers.health import router as health_router
 from .routers.db_check import router as db_check_router
+from .routers.auth import router as auth_router
 from .routers.players import router as players_router
 
 
-app = FastAPI(
-    title="SQL Trainer API",
-    version="0.1.0",
+app = FastAPI(title="Connect4 API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -18,6 +24,7 @@ def root() -> dict:
     return {"status": "ok", "message": "API is running!"}
 
 
-app.include_router(health_router)  # Include the health check router
-app.include_router(db_check_router)  # Include the database check router
-app.include_router(players_router)  # Include the players router
+app.include_router(health_router)
+app.include_router(db_check_router)
+app.include_router(auth_router)
+app.include_router(players_router)

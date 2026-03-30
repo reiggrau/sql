@@ -13,7 +13,7 @@ security_scheme = HTTPBearer()
 def create_access_token(player_id: int) -> str:
     """Generates a JWT access token for the given player ID."""
     expire = datetime.now(timezone.utc) + \
-        timedelta(minutes=settings.acces_token_expire_minutes)
+        timedelta(minutes=settings.access_token_expire_minutes)
     payload = {"sub": str(player_id), "exp": expire}
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
 

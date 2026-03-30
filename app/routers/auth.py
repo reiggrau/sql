@@ -10,13 +10,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 class AuthRequest(BaseModel):
-	"""Request body for authentication endpoints."""
+    """Request body for authentication endpoints."""
     username: str
     password: str
 
 
 class TokenResponse(BaseModel):
-	"""Response model for authentication endpoints."""
+    """Response model for authentication endpoints."""
     access_token: str
     token_type: str = "bearer"
 

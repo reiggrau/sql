@@ -12,24 +12,24 @@ def get_connection():
 
 def fetch_one(sql: str, params: tuple | None = None) -> dict | None:
     """Execute a SQL query and return a single result as a dictionary."""
-    with get_connection() as conn:  # Ensure the connection is closed after use
-        with conn.cursor() as cur:  # Ensure the cursor is closed after use
-            cur.execute(sql, params or ())  # Execute the SQL query
-            return cur.fetchone()  # Fetch a single result and return it
+    with get_connection() as connection:  # Ensure the connection is closed after use
+        with connection.cursor() as cursor:  # Ensure the cursor is closed after use
+            cursor.execute(sql, params or ())  # Execute the SQL query
+            return cursor.fetchone()  # Fetch a single result and return it
 
 
 def fetch_all(sql: str, params: tuple | None = None) -> list[dict]:
     """Execute a SQL query and return all results as a list of dictionaries."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            return cur.fetchall()
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            return cursor.fetchall()
 
 
 def execute(sql: str, params: tuple | None = None) -> dict | None:
     """Execute a write query (INSERT/UPDATE/DELETE) and return the result."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            conn.commit()
-            return cur.fetchone()
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params or ())
+            connection.commit()
+            return cursor.fetchone()

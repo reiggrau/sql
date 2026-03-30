@@ -14,7 +14,7 @@ Built with FastAPI, PostgreSQL (raw SQL via psycopg), and vanilla JavaScript on 
 | PostgreSQL                | Database                            |
 | psycopg                   | PostgreSQL driver (raw SQL, no ORM) |
 | pydantic-settings         | Environment config                  |
-| passlib[bcrypt]           | Password hashing                    |
+| bcrypt                    | Password hashing                    |
 | python-jose[cryptography] | JWT creation and verification       |
 
 ## Getting started
@@ -317,17 +317,17 @@ The `-m` flag runs `scripts/seed.py` as a module, which means Python resolves im
 Install the two libraries needed for authentication:
 
 ```bash
-pip install "passlib[bcrypt]" "python-jose[cryptography]"
+pip install bcrypt "python-jose[cryptography]"
 ```
 
-| Package                     | Why                                                                                                                                                                                |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `passlib[bcrypt]`           | Password hashing library. bcrypt is the hashing algorithm — it's deliberately slow, which makes brute-force attacks impractical. The `[bcrypt]` extra installs the bcrypt backend. |
-| `python-jose[cryptography]` | Creates and verifies JSON Web Tokens (JWTs). The `[cryptography]` extra gives it a fast C backend for signing operations.                                                          |
+| Package                     | Why                                                                                                                                         |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bcrypt`                    | Password hashing. bcrypt is deliberately slow, which makes brute-force attacks impractical. We use it directly — no wrapper library needed. |
+| `python-jose[cryptography]` | Creates and verifies JSON Web Tokens (JWTs). The `[cryptography]` extra gives it a fast C backend for signing operations.                   |
 
 **Why two separate libraries?** They solve different problems:
 
-- `passlib` turns a plain password into an irreversible hash for storage. You can verify a password against a hash, but you can never recover the original password from the hash.
+- `bcrypt` turns a plain password into an irreversible hash for storage. You can verify a password against a hash, but you can never recover the original password from the hash.
 - `python-jose` creates a signed token containing data (like a player ID). The token is not encrypted — anyone can read its contents — but only the server can create valid ones because only the server knows the `SECRET_KEY`.
 
 ---
@@ -454,27 +454,25 @@ The `RETURNING id` clause tells PostgreSQL to send back the auto-generated ID, w
 
 ### Step 9 — Create `core/security.py`
 
-This file is responsible for one thing: turning passwords into hashes and verifying them. It's a thin wrapper around passlib.
+This file is responsible for one thing: turning passwords into hashes and verifying them. We use `bcrypt` directly — no wrapper library needed.
 
 Create **`app/core/security.py`**:
 
 ```python
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
 
 
 def hash_password(plain_password: str) -> str:
-    return pwd_context.hash(plain_password)
+    return bcrypt.hashpw(plain_password.encode(), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())
 ```
 
 **How it works:**
 
-`CryptContext` is passlib's central object. You tell it which hashing schemes to support — we only need `"bcrypt"`. The `deprecated="auto"` setting means if you ever add a second scheme (e.g., argon2), passlib will automatically re-hash passwords using the new scheme when users log in. Future-proofing for free.
+`bcrypt.gensalt()` generates a random salt. `bcrypt.hashpw()` hashes the password with that salt. Both functions work with bytes, so we `.encode()` the string input and `.decode()` the bytes output.
 
 **`hash_password("secret123")`** produces something like:
 
@@ -669,36 +667,496 @@ def login(body: AuthRequest):
 
 ### Step 12 — Create `routers/players.py`
 
-Build `GET /players/me` as a protected endpoint using the `get_current_player` dependency.
+This router has a single protected endpoint that returns the authenticated player's profile. It's the simplest way to verify the entire auth chain is working end-to-end.
+
+Create **`app/routers/players.py`**:
+
+```python
+from fastapi import APIRouter, Depends
+from app.core.auth import get_current_player
+
+router = APIRouter(prefix="/players", tags=["players"])
+
+
+@router.get("/me", summary="Get my profile")
+def get_me(player: dict = Depends(get_current_player)):
+    return player
+```
+
+That's the entire file. Here's what happens when a request hits `GET /players/me`:
+
+1. FastAPI sees `Depends(get_current_player)` in the function signature
+2. It calls `get_current_player()` **before** your function runs
+3. `get_current_player()` extracts the Bearer token from the header, decodes the JWT, looks up the player in the database
+4. If everything succeeds, the player dict is passed as the `player` parameter
+5. If anything fails (no token, expired token, invalid token, deleted player), a 401 response is returned — your function never executes
+
+**`Depends()` is FastAPI's dependency injection.** It's the framework's way of saying "run this other function first, and give me the result." You'll use the same pattern across all protected endpoints — just add `player: dict = Depends(get_current_player)` to any route that requires authentication.
+
+The response will look like:
+
+```json
+{
+	"id": 1,
+	"username": "alice",
+	"created_at": "2026-03-30T12:00:00"
+}
+```
+
+Note: `password_hash` is **not** in the response because the SQL query in `get_current_player()` only selects `id, username, created_at`. This is intentional — never return sensitive data that the client doesn't need.
+
+---
 
 ### Step 13 — Update `main.py`
 
-Wire in the new routers (auth, players) and add CORS middleware.
+Now wire the new routers into the app and add CORS middleware so the frontend can talk to the API.
 
-### Step 14 — Create the `games` and `moves` tables
+Update **`app/main.py`**:
 
-Extend `scripts/seed.py` with tables for game sessions (`games`) and move history (`moves`).
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers.health import router as health_router
+from .routers.db_check import router as db_check_router
+from .routers.auth import router as auth_router
+from .routers.players import router as players_router
 
-### Step 15 — Create `routers/lobbies.py`
+app = FastAPI(title="Connect4 API", version="0.1.0")
 
-Build endpoints to create a game (`POST /lobbies`), list open games (`GET /lobbies`), and join a game (`POST /lobbies/{id}/join`).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-### Step 16 — Create `routers/games.py`
 
-Build endpoints to retrieve game history (`GET /games`) and full game state with moves (`GET /games/{id}`).
+@app.get("/", tags=["root"], summary="Root endpoint")
+def root() -> dict:
+    return {"status": "ok", "message": "API is running!"}
 
-### Step 17 — Create `ws/manager.py`
 
-Implement a `ConnectionManager` class that tracks active WebSocket connections per game room.
+app.include_router(health_router)
+app.include_router(db_check_router)
+app.include_router(auth_router)
+app.include_router(players_router)
+```
 
-### Step 18 — Create `ws/game.py`
+**What changed:**
 
-Build the WebSocket endpoint (`ws://host/ws/games/{game_id}?token=<JWT>`) with token authentication, move validation, turn enforcement, server-side win detection, and message broadcasting to both players.
+- **Added `auth_router`** — exposes `POST /auth/register` and `POST /auth/login`
+- **Updated `players_router`** — now points to the new `players.py` with the protected `/players/me` endpoint
+- **Added CORS middleware** — this is essential for frontend ↔ backend communication
 
-### Step 19 — Freeze dependencies
+**Why CORS?**
 
-Run `pip freeze > requirements.txt` to lock all package versions.
+When your frontend (served from `localhost:3000` or a file) makes a `fetch()` request to the API (on `localhost:8000`), the browser blocks it by default — they're different **origins** (different port = different origin). This is a security feature called the Same-Origin Policy.
 
-### Step 20 — Test the full flow
+CORS (Cross-Origin Resource Sharing) tells the browser: "it's OK, I trust requests from these origins." The middleware adds the necessary response headers.
 
-Register → login → create lobby → join → play via WebSocket → win → check game history.
+`allow_origins=["*"]` means "allow any origin." This is fine for development. In production, you'd restrict it to your actual frontend domain:
+
+```python
+allow_origins=["https://yourgame.com"]
+```
+
+**Test the full auth flow in `/docs`:**
+
+1. Start the server: `uvicorn app.main:app --reload`
+2. Open http://127.0.0.1:8000/docs
+3. **POST /auth/register** — send `{"username": "alice", "password": "secret123"}` → you get a token
+4. Click the 🔒 **Authorize** button (top right of the page)
+5. Paste the token string (just the token, not "Bearer ...")
+6. **GET /players/me** → should return alice's profile
+7. Try without a token → 401
+8. **POST /auth/login** — same credentials → fresh token
+9. Try a wrong password → 401 "Invalid username or password"
+10. Try registering "alice" again → 409 "Username already taken"
+
+---
+
+### Step 14 — Create `ws/manager.py` — the lobby + room tracker
+
+All lobby and game state lives **in memory** — no database tables needed. When the server restarts, lobbies and in-progress games are lost, which is fine for a real-time game. The `ConnectionManager` is responsible for:
+
+- Tracking open lobbies (games waiting for a second player)
+- Tracking active games (two connected players)
+- Relaying messages between both players in a game
+
+Create the folder and files:
+
+```
+app/
+└── ws/
+    ├── __init__.py
+    └── manager.py
+```
+
+**`app/ws/manager.py`**:
+
+```python
+from fastapi import WebSocket
+
+
+class Game:
+    """Represents a single game room (lobby or in-progress)."""
+
+    def __init__(self, game_id: str, host: dict, ws: WebSocket):
+        self.game_id = game_id
+        self.host = host            # player dict from get_current_player
+        self.guest = None           # filled when someone joins
+        self.connections: dict[int, WebSocket] = {host["id"]: ws}
+
+    @property
+    def is_full(self) -> bool:
+        return self.guest is not None
+
+    def add_guest(self, player: dict, ws: WebSocket):
+        self.guest = player
+        self.connections[player["id"]] = ws
+
+    async def broadcast(self, message: dict):
+        """Send a JSON message to all connected players."""
+        for ws in self.connections.values():
+            await ws.send_json(message)
+
+    async def send_to(self, player_id: int, message: dict):
+        """Send a JSON message to a specific player."""
+        ws = self.connections.get(player_id)
+        if ws:
+            await ws.send_json(message)
+
+    def other_id(self, player_id: int) -> int | None:
+        """Return the other player's ID, or None if solo."""
+        if player_id == self.host["id"] and self.guest:
+            return self.guest["id"]
+        if self.guest and player_id == self.guest["id"]:
+            return self.host["id"]
+        return None
+
+
+class ConnectionManager:
+    """Tracks all lobbies and active games in memory."""
+
+    def __init__(self):
+        self.games: dict[str, Game] = {}  # game_id -> Game
+
+    def create_game(self, game_id: str, host: dict, ws: WebSocket) -> Game:
+        game = Game(game_id, host, ws)
+        self.games[game_id] = game
+        return game
+
+    def get_game(self, game_id: str) -> Game | None:
+        return self.games.get(game_id)
+
+    def remove_game(self, game_id: str):
+        self.games.pop(game_id, None)
+
+    def get_open_lobbies(self) -> list[dict]:
+        """Return all games that are waiting for a second player."""
+        return [
+            {"game_id": g.game_id, "host": g.host["username"]}
+            for g in self.games.values()
+            if not g.is_full
+        ]
+
+
+manager = ConnectionManager()
+```
+
+**Key design decisions:**
+
+- **No board, no turns, no win detection on the server.** The server is a relay — it forwards moves between the two clients. All game logic (coin drops, win checks, turn tracking) stays in the frontend, which already implements it.
+- **`Game.connections`** — maps `player_id → WebSocket`. This lets us relay a move from one player to the other, or broadcast messages to both.
+- **`Game.other_id()`** — helper to find the opponent's ID so we can forward moves to the right player.
+- **`manager` singleton** — one global instance shared across all WebSocket connections. Since Uvicorn runs in a single process (with `--reload`), all connections share the same Python objects in memory.
+- **No database** — lobbies and games are ephemeral. They exist only while players are connected. Server restart = clean slate.
+
+---
+
+### Step 15 — Create `routers/lobbies.py` — REST endpoints for lobby listing
+
+Clients need a way to discover open lobbies **before** connecting via WebSocket. This is a simple REST endpoint — no WebSocket involved yet.
+
+Create **`app/routers/lobbies.py`**:
+
+```python
+from fastapi import APIRouter
+from app.ws.manager import manager
+
+router = APIRouter(prefix="/lobbies", tags=["lobbies"])
+
+
+@router.get("", summary="List open lobbies")
+def list_lobbies():
+    return manager.get_open_lobbies()
+```
+
+The response is a list of lobbies waiting for a second player:
+
+```json
+[{ "game_id": "abc123", "host": "alice" }]
+```
+
+The frontend will poll this endpoint (or fetch it once when entering the online menu) to show available games. Once a player picks a lobby, the frontend connects via WebSocket (next step).
+
+**Why REST instead of WebSocket for listing?** Listing lobbies is a one-shot read — the client asks, gets a list, renders it. WebSocket is overkill for that. The WebSocket connection starts when the player actually creates or joins a game.
+
+---
+
+### Step 16 — Create `ws/game.py` — the WebSocket endpoint
+
+This is the core of multiplayer — the WebSocket endpoint where players connect to create or join games. The server doesn't track the board or enforce rules — it's a **relay** that forwards each player's actions to their opponent. All game logic (coin drops, turn tracking, win detection) stays in the frontend.
+
+Create **`app/ws/game.py`**:
+
+```python
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from jose import JWTError, jwt
+from app.core.settings import settings
+from app.db.connection import fetch_one
+from app.ws.manager import manager
+
+router = APIRouter()
+
+
+def authenticate_ws(token: str) -> dict | None:
+    """Validate a JWT token and return the player dict, or None."""
+    try:
+        payload = jwt.decode(
+            token, settings.secret_key, algorithms=[settings.algorithm]
+        )
+        player_id = payload.get("sub")
+        if player_id is None:
+            return None
+    except JWTError:
+        return None
+
+    return fetch_one(
+        "SELECT id, username FROM players WHERE id = %s;",
+        (int(player_id),),
+    )
+
+
+@router.websocket("/ws/games/{game_id}")
+async def game_ws(ws: WebSocket, game_id: str, token: str = Query(...)):
+    # --- Auth ---
+    player = authenticate_ws(token)
+    if not player:
+        await ws.close(code=4001, reason="Invalid or expired token")
+        return
+
+    await ws.accept()
+
+    # --- Join or create ---
+    game = manager.get_game(game_id)
+
+    if game is None:
+        # No game with this ID exists → create a new lobby
+        game = manager.create_game(game_id, player, ws)
+        await ws.send_json({
+            "type": "waiting",
+            "message": "Lobby created. Waiting for opponent...",
+            "game_id": game_id,
+            "color": "Yellow",
+        })
+
+    elif not game.is_full:
+        # Lobby exists and needs a second player → join
+        if player["id"] == game.host["id"]:
+            await ws.send_json({"type": "error", "message": "You are already the host"})
+            await ws.close()
+            return
+
+        game.add_guest(player, ws)
+        await game.broadcast({
+            "type": "start",
+            "message": "Game started!",
+            "game_id": game_id,
+            "host": game.host["username"],
+            "guest": game.guest["username"],
+            "turn": game.host["username"],
+        })
+
+    else:
+        # Game is full → reject
+        await ws.send_json({"type": "error", "message": "Game is full"})
+        await ws.close()
+        return
+
+    # --- Relay loop ---
+    try:
+        while True:
+            data = await ws.receive_json()
+
+            # Forward the message to the other player
+            other = game.other_id(player["id"])
+            if other is None:
+                await ws.send_json({
+                    "type": "error",
+                    "message": "Waiting for opponent",
+                })
+                continue
+
+            # Attach the sender's info and relay
+            data["player"] = player["username"]
+            await game.send_to(other, data)
+
+    except WebSocketDisconnect:
+        # Notify the other player and clean up
+        game.connections.pop(player["id"], None)
+        if game.connections:
+            for remaining_ws in game.connections.values():
+                await remaining_ws.send_json({
+                    "type": "opponent_left",
+                    "message": f"{player['username']} disconnected",
+                })
+        manager.remove_game(game_id)
+```
+
+**The WebSocket URL:**
+
+```
+ws://localhost:8000/ws/games/{game_id}?token=<JWT>
+```
+
+- `game_id` — any string. To **create** a lobby, the host picks a unique ID (we'll use `uuid4` on the frontend). To **join**, the guest uses an existing game's ID from the lobby list.
+- `token` — the JWT from login/register. WebSockets don't support `Authorization` headers in browsers, so we pass the token as a query parameter.
+
+**Why `authenticate_ws()` instead of reusing `get_current_player()`?** The `get_current_player()` dependency uses FastAPI's `Depends(HTTPBearer())`, which only works with HTTP requests. WebSocket connections don't have standard HTTP headers in the browser, so we extract the token from the query string and validate it manually. Same logic, different plumbing.
+
+**The relay approach — why no game logic on the server?**
+
+The frontend already has full Connect 4 game logic — coin drop animations, win detection via CSS class scanning, turn tracking. Rather than duplicating all of that on the server, the backend acts as a **dumb pipe**: whatever message one client sends gets forwarded to the other, with the sender's username attached. The frontend handles everything else.
+
+This means we're trusting the clients. A malicious player could send fake moves, but for a casual game between friends this is fine. The tradeoff is simplicity — the entire relay loop is ~10 lines of code.
+
+**Message flow:**
+
+1. Player A clicks a column → frontend drops the coin locally → sends `{"type": "move", "column": 3}` to the server
+2. Server attaches `"player": "alice"` and forwards it to Player B
+3. Player B's frontend receives the message and drops the coin in column 3
+4. Player B's frontend detects it's now their turn
+5. If either frontend detects a win, it shows the win screen locally
+
+**Message types — server → client (server-generated):**
+
+| `type`          | When                      | Key fields              |
+| --------------- | ------------------------- | ----------------------- |
+| `waiting`       | Host creates a lobby      | `game_id`, `color`      |
+| `start`         | Guest joins, game begins  | `host`, `guest`, `turn` |
+| `error`         | Invalid action            | `message`               |
+| `opponent_left` | Other player disconnected | `message`               |
+
+**Message types — client → server → other client (relayed):**
+
+Any JSON the client sends is forwarded to the opponent with `"player"` attached. The frontend decides what types to send — the server doesn't inspect or validate them. Typical messages:
+
+| `type` | Fields   | Purpose                              |
+| ------ | -------- | ------------------------------------ |
+| `move` | `column` | Player dropped a coin in this column |
+| `win`  | —        | Player's frontend detected a win     |
+
+**Disconnection handling:** When a player's WebSocket closes (browser tab closed, network drop), `WebSocketDisconnect` fires. The server notifies the remaining player and removes the game entirely. No reconnection support — if you disconnect, the game is over.
+
+---
+
+### Step 17 — Update `main.py` — wire WebSocket + lobbies
+
+Add the new routers to the app:
+
+Update **`app/main.py`**:
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .routers.health import router as health_router
+from .routers.db_check import router as db_check_router
+from .routers.auth import router as auth_router
+from .routers.players import router as players_router
+from .routers.lobbies import router as lobbies_router
+from .ws.game import router as game_ws_router
+
+app = FastAPI(title="Connect4 API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/", tags=["root"], summary="Root endpoint")
+def root() -> dict:
+    return {"status": "ok", "message": "API is running!"}
+
+
+app.include_router(health_router)
+app.include_router(db_check_router)
+app.include_router(auth_router)
+app.include_router(players_router)
+app.include_router(lobbies_router)
+app.include_router(game_ws_router)
+```
+
+Two new lines:
+
+- `lobbies_router` — the `GET /lobbies` REST endpoint from Step 15
+- `game_ws_router` — the `ws://host/ws/games/{game_id}` WebSocket endpoint from Step 16
+
+---
+
+### Step 18 — Freeze dependencies
+
+```bash
+pip freeze > requirements.txt
+```
+
+This locks every package and its exact version so anyone cloning the repo gets the same environment.
+
+---
+
+### Step 19 — Test the full flow
+
+You can test the WebSocket with two browser tabs (or use a WebSocket client like Postman or `websocat`).
+
+**Setup:**
+
+1. Start the server: `uvicorn app.main:app --reload`
+2. Register two players via `/docs`:
+   - `POST /auth/register` → `{"username": "alice", "password": "secret123"}` → save token A
+   - `POST /auth/register` → `{"username": "bob", "password": "secret456"}` → save token B
+
+**Test lobby listing:**
+
+3. `GET /lobbies` → `[]` (no lobbies yet)
+
+**Test game creation (Player A = host):**
+
+4. Connect Player A via WebSocket:
+   ```
+   ws://localhost:8000/ws/games/test-game-1?token=<token_A>
+   ```
+5. Player A receives: `{"type": "waiting", "message": "Lobby created...", "game_id": "test-game-1", "color": "Yellow"}`
+6. `GET /lobbies` → `[{"game_id": "test-game-1", "host": "alice"}]`
+
+**Test joining (Player B = guest):**
+
+7. Connect Player B to the same game:
+   ```
+   ws://localhost:8000/ws/games/test-game-1?token=<token_B>
+   ```
+8. Both players receive: `{"type": "start", "host": "alice", "guest": "bob", "turn": "alice"}`
+9. `GET /lobbies` → `[]` (game is full, no longer listed)
+
+**Test gameplay:**
+
+10. Player A sends: `{"type": "move", "column": 3}` → Player B receives `{"type": "move", "column": 3, "player": "alice"}`
+11. Player B sends: `{"type": "move", "column": 4}` → Player A receives `{"type": "move", "column": 4, "player": "bob"}`
+12. Messages are only forwarded to the **other** player — you don't receive your own messages back
+
+**Test disconnection:**
+
+13. Close Player A's WebSocket → Player B receives `{"type": "opponent_left"}`
+14. `GET /lobbies` → `[]` (game was removed)
